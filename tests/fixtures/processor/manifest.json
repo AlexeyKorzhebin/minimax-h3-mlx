@@ -1,0 +1,70 @@
+{
+  "landscape": {
+    "size": [
+      640,
+      384
+    ],
+    "pixel_values_shape": [
+      960,
+      1536
+    ],
+    "image_grid_thw": [
+      [
+        1,
+        24,
+        40
+      ]
+    ]
+  },
+  "portrait": {
+    "size": [
+      384,
+      640
+    ],
+    "pixel_values_shape": [
+      960,
+      1536
+    ],
+    "image_grid_thw": [
+      [
+        1,
+        40,
+        24
+      ]
+    ]
+  },
+  "tiny": {
+    "size": [
+      64,
+      48
+    ],
+    "pixel_values_shape": [
+      280,
+      1536
+    ],
+    "image_grid_thw": [
+      [
+        1,
+        14,
+        20
+      ]
+    ]
+  },
+  "huge": {
+    "size": [
+      2048,
+      1536
+    ],
+    "pixel_values_shape": [
+      12288,
+      1536
+    ],
+    "image_grid_thw": [
+      [
+        1,
+        96,
+        128
+      ]
+    ]
+  }
+}

@@ -1,0 +1,276 @@
+diff --git a/minimax_h3_mlx/dit.py b/minimax_h3_mlx/dit.py
+index 4aa8cca..4f12b07 100644
+--- a/minimax_h3_mlx/dit.py
++++ b/minimax_h3_mlx/dit.py
+@@ -113,18 +113,112 @@ def apply_rotary(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+     """Rotate the leading ``rotary_dim`` channels of every head, pass the rest through.
+ 
+     ``x`` is ``(batch, heads, seq, head_dim)``; ``cos``/``sin`` are ``(seq, rotary_dim)``.
++
++    PATCHED IN THIS FORK (`patches/0002-attention-memory-levers.patch`). The straightforward
++    spelling splits ``x`` into a rotated and a passed-through half, rotates the first, and
++    concatenates the two back together::
++
++        x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
++        x1, x2 = x_rot[..., :half], x_rot[..., half:]
++        rotated = mx.concatenate([-x2, x1], axis=-1)
++        out = x_rot * cos + rotated * sin
++        return out if x_pass.shape[-1] == 0 else mx.concatenate([out, x_pass], axis=-1)
++
++    That is five full-size temporaries (``x_rot``, ``rotated``, the two products, the final
++    concatenate) for what is elementwise work. Padding ``cos``/``sin`` out to the full
++    ``head_dim`` with 1 and 0 makes the pass-through channels fall out of the *same* expression —
++    ``x * 1 + rotated * 0`` is the identity, exactly, at any float width — so the split and the
++    trailing concatenate both disappear and two temporaries do the job of five. Measured worth:
++    1.02 GB of peak on a 10 s native forward (37.23 -> 36.21 GB, `docs/RESULTS.md`);
++    bit-identical, which `tests/test_attention_levers.py` pins.
+     """
+     rotary_dim = cos.shape[-1]
+-    x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
++    head_dim = x.shape[-1]
++    half = rotary_dim // 2
++    pad = head_dim - rotary_dim
++    if pad:
++        cos = mx.concatenate([cos, mx.ones((cos.shape[0], pad), dtype=cos.dtype)], axis=-1)
++        sin = mx.concatenate([sin, mx.zeros((sin.shape[0], pad), dtype=sin.dtype)], axis=-1)
+     cos = cos.astype(x.dtype)[None, None, :, :]
+     sin = sin.astype(x.dtype)[None, None, :, :]
+-    half = rotary_dim // 2
+-    x1, x2 = x_rot[..., :half], x_rot[..., half:]
+-    rotated = mx.concatenate([-x2, x1], axis=-1)
+-    out = x_rot * cos + rotated * sin
+-    if x_pass.shape[-1] == 0:
+-        return out
+-    return mx.concatenate([out, x_pass], axis=-1)
++    pieces = [-x[..., half:rotary_dim], x[..., :half]]
++    if pad:
++        pieces.append(x[..., rotary_dim:])
++    rotated = mx.concatenate(pieces, axis=-1)
++    return x * cos + rotated * sin
++
++
++#: PATCHED IN THIS FORK (`patches/0002-attention-memory-levers.patch`). Attention runs over query
++#: rows in slices this wide once the sequence is longer than one. Softmax is per query row, so
++#: nothing crosses a slice boundary and the result is bit-identical — what changes is that q, the
++#: attention output and the rotary temporaries exist one slice at a time instead of all at once,
++#: while k and v stay whole. 8192 is empirical: large enough that the per-slice kernel launches and
++#: the `k`/`v` re-reads stay in the noise — at 73k rows it made the forward *faster*, 72.9 s to
++#: 69.0 s — and small enough to matter once the MLP horn below it is lowered too. On its own it
++#: moved the peak by nothing at all, because until `mlp-chunk` landed the peak was the MLP's;
++#: the two together are worth 2.26 GB. Read at call time, so a test can lower it.
++QUERY_CHUNK = 8192
++
++#: PATCHED IN THIS FORK. The same idea for the feed-forward, which is row-local outright — see
++#: `FeedForward.__call__`. Same width and for the same reason: the two levers only pay off
++#: together, and one number is one thing to retune.
++FFN_ROW_CHUNK = 8192
++
++
++def prepare_rows(layer, x: mx.array):
++    """Whatever ``layer`` needs computed once over the *whole* sequence before row-chunked use.
++
++    PATCHED IN THIS FORK (`patches/0002-attention-memory-levers.patch`).
++
++    Chunking a linear layer by rows is arithmetically free — every output row reads one input row —
++    but it is not automatically *bit* free. MLX picks a GEMM tiling by shape, and for a narrow
++    output it splits the reduction differently at different row counts: measured on this machine,
++    ``x @ lora_a.T`` at 7168-wide input and rank 64 differs by one bf16 ULP between a 6247-row call
++    and the concatenation of 2048-row calls. Every spelling tried (``addmm`` into zeros, float32
++    accumulation) has the same property, so it is the kernel, not the expression.
++
++    That matters only for the LoRA side path, whose rank-r read is the one narrow matmul in the
++    model — and it happens to be the one thing small enough to hoist: ``(seq, 64)`` is 9 MB where
++    the activations being chunked are gigabytes. So a layer may declare a whole-sequence
++    precomputation here and consume slices of it in `apply_rows`, which keeps chunked and unchunked
++    forwards bit-identical instead of merely close. Layers that declare nothing are applied to the
++    slice directly, which for the quantized base projections is exact (verified: an 8-bit
++    ``QuantizedLinear`` gives identical bits on a slice and on the whole).
++    """
++    prepare = getattr(layer, "prepare_rows", None)
++    return None if prepare is None else prepare(x)
++
++
++def apply_rows(layer, x: mx.array, prepared, start: int, stop: int) -> mx.array:
++    """Apply ``layer`` to rows ``[start:stop]`` of ``x``, feeding it its own `prepare_rows` slice."""
++    rows = x[:, start:stop]
++    if prepared is None:
++        return layer(rows)
++    return layer.apply_rows(rows, prepared[:, start:stop])
++
++
++def carve_rows(layer: nn.Module, rows: mx.array) -> nn.Module:
++    """A copy of ``layer`` holding only ``rows`` of its output.
++
++    PATCHED IN THIS FORK (`patches/0002-attention-memory-levers.patch`); see
++    ``Attention.split_projections``.
++
++    Built by ``__new__`` rather than by the constructor on purpose: every shape and flag is taken
++    from the source layer, and calling the constructor would first allocate a full-size randomly
++    initialized weight — 154 MB per projection at the shipped size, for something overwritten on
++    the next line.
++    """
++    carved = type(layer).__new__(type(layer))
++    nn.Module.__init__(carved)
++    for attr in ("weight", "scales", "biases", "bias"):
++        value = getattr(layer, attr, None)
++        if isinstance(value, mx.array):
++            setattr(carved, attr, value[rows])
++    for attr in ("group_size", "bits", "mode"):
++        if hasattr(layer, attr):
++            setattr(carved, attr, getattr(layer, attr))
++    mx.eval(carved.parameters())
++    return carved
+ 
+ 
+ class Attention(nn.Module):
+@@ -141,12 +235,114 @@ class Attention(nn.Module):
+         self.k_norm = nn.RMSNorm(config.attention_head_dim, eps=config.qk_norm_eps)
+         self.out_proj = nn.Linear(config.inner_dim, config.hidden_size, bias=False)
+ 
++    # -- PATCHED IN THIS FORK (`patches/0002-attention-memory-levers.patch`) --------------------
++
++    @property
++    def is_split(self) -> bool:
++        """Whether ``split_projections`` has already carved this layer's fused projection."""
++        return "q_proj" in self
++
++    def qkv_rows(self) -> mx.array:
++        """``(3, heads * head_dim)`` — the fused output rows belonging to q, to k and to v.
++
++        The raw checkpoint interleaves per head (``[h0: q,k,v][h1: q,k,v]...``), so q's rows are
++        ``h * 3 * head_dim + d`` over every head. Gathering them yields ``[h0, h1, ...]`` — which
++        is exactly the layout an unfused ``q_proj`` would have had, and exactly the order the
++        released LoRA's own ``[all-q; all-k; all-v]`` slabs are in. That coincidence is what lets
++        `h3_48gb.turbo` split a fused ``lora_B`` by slicing rather than by permuting.
++        """
++        index = mx.arange(3 * self.heads * self.head_dim)
++        return index.reshape(self.heads, 3, self.head_dim).transpose(1, 0, 2).reshape(3, -1)
++
++    def split_projections(self) -> None:
++        """Carve the fused ``qkv_proj`` into ``q_proj`` / ``k_proj`` / ``v_proj``. Idempotent.
++
++        Exact, including under quantization: MLX's affine quantization groups along the *input*
++        axis, so ``scales`` and ``biases`` are ``(rows, in_features / group_size)`` and every row
++        carries its own. Gathering rows moves each row's scale with it — nothing is dequantized,
++        requantized or rounded, which is why this can be done to a loaded 8-bit checkpoint at all.
++
++        What it buys is staging, not arithmetic. Fused, the ``(seq, 3 * inner_dim)`` projection
++        output — 4.8 GB at 73k rows — has to be fully live before q, k or v can be sliced out of
++        it, and it stays live until the last slice is taken. Split, k and v are built and reduced
++        to their final form before q is even projected, so the widest thing alive at once is one
++        third the size. The fused projection is dropped afterwards: keeping it would duplicate
++        ~6 GB of weights and swamp the saving.
++        """
++        if self.is_split:
++            return
++        rows = self.qkv_rows()
++        for part, name in enumerate(("q_proj", "k_proj", "v_proj")):
++            setattr(self, name, carve_rows(self.qkv_proj, rows[part]))
++        self.pop("qkv_proj", None)
++
++    def _heads(self, x: mx.array, projection, norm=None) -> mx.array:
++        """``(B, S, hidden)`` -> ``(B, heads, S, head_dim)`` through one projection."""
++        B, S, _ = x.shape
++        h = projection(x).reshape(B, S, self.heads, self.head_dim)
++        if norm is not None:
++            h = norm(h)
++        return h.transpose(0, 2, 1, 3)
++
++    def _split_call(self, x, rotary, mask):
++        """Same arithmetic as the fused path, with k and v staged before q exists."""
++        B, S, _ = x.shape
++        v = self._heads(x, self.v_proj)
++        k = self._heads(x, self.k_proj, self.k_norm)
++        if rotary is not None:
++            k = apply_rotary(k, *rotary)
++        q = self._heads(x, self.q_proj, self.q_norm)
++        if rotary is not None:
++            q = apply_rotary(q, *rotary)
++        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
++        out = out.transpose(0, 2, 1, 3).reshape(B, S, self.heads * self.head_dim)
++        return self.out_proj(out.astype(x.dtype))
++
++    def _chunked_call(self, x, rotary):
++        """`_split_call` with the query side taken ``QUERY_CHUNK`` rows at a time.
++
++        Every query row attends to the whole sequence and softmax normalizes within a row, so a
++        slice of query rows is a self-contained problem: k and v are built once and whole, and the
++        slice loop only ever narrows what is live on the q side. No mask is threaded through —
++        the caller's mask is per (query, key) pair and slicing it correctly is a different change;
++        `__call__` sends masked calls down the unchunked path instead.
++        """
++        B, S, _ = x.shape
++        v = self._heads(x, self.v_proj)
++        k = self._heads(x, self.k_proj, self.k_norm)
++        if rotary is not None:
++            k = apply_rotary(k, *rotary)
++        cos, sin = rotary if rotary is not None else (None, None)
++
++        prepared = prepare_rows(self.q_proj, x)
++        chunks = []
++        for start in range(0, S, QUERY_CHUNK):
++            stop = min(start + QUERY_CHUNK, S)
++            projected = apply_rows(self.q_proj, x, prepared, start, stop)
++            q = self.q_norm(
++                projected.reshape(B, stop - start, self.heads, self.head_dim)
++            ).transpose(0, 2, 1, 3)
++            if rotary is not None:
++                q = apply_rotary(q, cos[start:stop], sin[start:stop])
++            attended = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=None)
++            chunks.append(attended.transpose(0, 2, 1, 3)
++                          .reshape(B, stop - start, self.heads * self.head_dim))
++        out = mx.concatenate(chunks, axis=1)
++        return self.out_proj(out.astype(x.dtype))
++
++    # --------------------------------------------------------------------------------------------
++
+     def __call__(
+         self,
+         x: mx.array,
+         rotary: tuple[mx.array, mx.array] | None = None,
+         mask: mx.array | None = None,
+     ) -> mx.array:
++        if self.is_split:
++            if mask is None and x.shape[-2] > QUERY_CHUNK:
++                return self._chunked_call(x, rotary)
++            return self._split_call(x, rotary, mask)
++
+         B, S, _ = x.shape
+         # Raw-checkpoint QKV rows are per-head interleaved: (..., heads, 3, head_dim).
+         qkv = self.qkv_proj(x).reshape(B, S, self.heads, 3, self.head_dim)
+@@ -175,9 +371,32 @@ class FeedForward(nn.Module):
+         self._ffn = config.ffn_hidden_size
+ 
+     def __call__(self, x: mx.array) -> mx.array:
+-        fused = self.fc1(x)
+-        gate, value = fused[..., : self._ffn], fused[..., self._ffn :]
+-        return self.fc2(nn.silu(gate) * value)
++        # PATCHED IN THIS FORK (`patches/0002-attention-memory-levers.patch`). The MLP is entirely
++        # row-local, and its widest buffer by far is `fc1`'s fused `[gate; value]` output: twice
++        # the FFN width, 57 KB per row against the 14 KB of the hidden stream, and it has to be
++        # live at the same time as the activation it feeds. Building it a chunk at a time leaves
++        # only the activation full-size — worth ~3.8 GB at 73k rows, and it is what uncovers the
++        # attention saving underneath, which until now was hidden below this horn.
++        #
++        # `fc2` deliberately still runs once, over the whole activation, rather than per chunk.
++        # Per chunk it would re-do its LoRA's narrow `act @ A.T` at a chunk's row count and land a
++        # bf16 ULP off (see `prepare_rows`) — and unlike `fc1`'s, that read cannot be hoisted,
++        # because the activation it reads is the very thing being built. One whole-tensor call is
++        # both exact and no more expensive: the output it writes is full-size either way.
++        S = x.shape[-2]
++        if S <= FFN_ROW_CHUNK:
++            fused = self.fc1(x)
++            gate, value = fused[..., : self._ffn], fused[..., self._ffn :]
++            return self.fc2(nn.silu(gate) * value)
++
++        prepared = prepare_rows(self.fc1, x)
++        activated = []
++        for start in range(0, S, FFN_ROW_CHUNK):
++            stop = min(start + FFN_ROW_CHUNK, S)
++            fused = apply_rows(self.fc1, x, prepared, start, stop)
++            gate, value = fused[..., : self._ffn], fused[..., self._ffn :]
++            activated.append(nn.silu(gate) * value)
++        return self.fc2(mx.concatenate(activated, axis=-2))
+ 
+ 
+ class AdaLayerNormModulation(nn.Module):

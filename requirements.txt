@@ -1,0 +1,23 @@
+# Runtime dependencies for this fork (h3_48gb/) and the vendored upstream port it patches.
+#
+# upstream/requirements.txt lists only mlx, numpy, safetensors and huggingface_hub — that omits
+# mlx-vlm, which upstream/minimax_h3_mlx/text_encoder.py imports unconditionally (h3_48gb wraps
+# that same module), and pillow, which h3_48gb/preview.py uses to write preview JPEGs. Installing
+# only upstream's list makes `h3 generate` fail at import time with
+# `ModuleNotFoundError: No module named 'mlx_vlm'`. Install from this file instead — see README.md
+# step 0.
+
+mlx>=0.32.0
+mlx-vlm>=0.6.10
+numpy>=1.26
+safetensors>=0.4
+huggingface_hub>=0.30
+pillow>=10.0
+
+# h3_48gb/facetrack.py: YuNet face detection and Savitzky-Golay track smoothing. CPU-only, no
+# mlx dependency -- see that module's docstring.
+opencv-python>=4.9
+scipy>=1.11
+
+# Test suite: pytest -q
+pytest>=8.0

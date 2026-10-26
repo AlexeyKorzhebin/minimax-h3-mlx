@@ -1,0 +1,26 @@
+minimax-h3-mlx
+Copyright 2026 the project contributors
+
+This project contains no model weights. It contains code only: patches (`h3_48gb/`) applied
+from outside an unmodified vendored copy of another project, and a converter
+(`convert_sawfwair.py`) that rewrites a user's own local weight download into the directory
+layout that vendored copy reads. Nothing in this repository, and nothing produced by cloning it,
+transfers, hosts, or redistributes MiniMax H3 model weights.
+
+MiniMax H3 — the weights `convert_sawfwair.py` reads and rewrites, which you must obtain
+yourself — is governed by the MiniMax H3 Community License. That license excludes use,
+distribution and display of the model in the United States, the European Union, the United
+Kingdom and the Republic of Korea, and imposes notice obligations on downstream redistribution.
+This project does not obtain, host, or distribute those weights; you download and convert your
+own copy, and you are responsible for confirming the license permits your use before you do so.
+
+The `upstream/` directory referenced throughout this repository's code and documentation is a
+vendored, unmodified clone of PipeNetwork/minimax-h3-mlx
+(https://github.com/PipeNetwork/minimax-h3-mlx), licensed under the Apache License, Version 2.0.
+It is not committed to this repository — see `.gitignore` and the README's setup step — and is
+never modified by this project; all fork-side behavior lives in `h3_48gb/`, applied from the
+outside, so `upstream/` can be fast-forwarded against the original project at any time.
+
+The code in `h3_48gb/`, `convert_sawfwair.py`, and the rest of this repository is original to
+this fork and is licensed under the Apache License, Version 2.0, the same license as the
+upstream project it patches. See LICENSE for the full license text.

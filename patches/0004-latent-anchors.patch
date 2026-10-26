@@ -1,0 +1,44 @@
+diff --git a/minimax_h3_mlx/packing.py b/minimax_h3_mlx/packing.py
+index ae35156..ab1fc29 100644
+--- a/minimax_h3_mlx/packing.py
++++ b/minimax_h3_mlx/packing.py
+@@ -256,7 +256,7 @@ def build_packed_sequence(
+     latent_width: int,
+     num_audio_latents: int,
+     patch_size: tuple[int, int, int],
+-    keyframe_anchors: tuple[str, ...] = (),
++    keyframe_anchors: tuple[str | int, ...] = (),
+ ) -> PackedSequence:
+     """Build the ``[text | keyframe conditions | target audio | target video]`` layout.
+ 
+@@ -264,7 +264,14 @@ def build_packed_sequence(
+         text_token_tags: modality tag of every text row. Text is tagged ``1``, except the rows of a
+             keyframe's vision block, which MiniMax-H3 tags ``0`` (video).
+         keyframe_anchors: one entry per keyframe conditioning block, in packed order; ``"first"``
+-            anchors at the first latent frame, ``"last"`` at the last.
++            anchors at the first latent frame, ``"last"`` at the last, and an integer anchors at
++            that pixel-frame index on the rotary time axis (``anchor_time = num_text +
++            _ROPE_FRAME_RESCALE * anchor`` -- the same formula ``"first"``/``"last"`` reduce to,
++            with ``pixel_index = 0`` / ``num_pixel_frames - 1`` respectively). This is a pixel
++            index, not a latent-frame array index: consecutive latent frames land on the
++            non-consecutive pixel indices ``0, 1, 5, 9, 13, 17, 18, ...`` per
++            ``_ROPE_FRAMES_PER_LATENT``, so anchoring at latent frame ``k`` means passing that
++            pixel index, not ``k`` itself.
+     """
+     _, ph, pw = patch_size
+     text_tags = np.asarray(text_token_tags, dtype=np.int64)
+@@ -297,8 +304,13 @@ def build_packed_sequence(
+             anchor_time = (
+                 float(num_text) + _temporal_position_span(num_latent_frames) - _ROPE_FRAME_RESCALE
+             )
++        elif isinstance(anchor, (int, np.integer)) and not isinstance(anchor, bool):
++            anchor_time = float(num_text) + _ROPE_FRAME_RESCALE * float(int(anchor))
+         else:
+-            raise ValueError(f"A keyframe anchor must be 'first' or 'last', got {anchor!r}.")
++            raise ValueError(
++                f"A keyframe anchor must be 'first', 'last', or an integer pixel-frame index, "
++                f"got {anchor!r}."
++            )
+         lo = condition_start + index * rows_per_frame
+         hi = condition_start + (index + 1) * rows_per_frame
+         position_ids[lo:hi, 0] = anchor_time

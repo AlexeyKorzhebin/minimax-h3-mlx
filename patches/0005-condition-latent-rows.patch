@@ -1,0 +1,108 @@
+diff --git a/minimax_h3_mlx/pipeline.py b/minimax_h3_mlx/pipeline.py
+index 069aaa9..9ba18cb 100644
+--- a/minimax_h3_mlx/pipeline.py
++++ b/minimax_h3_mlx/pipeline.py
+@@ -216,9 +216,10 @@ class MiniMaxH3Pipeline:
+         num_inference_steps: int = 16,
+         seed: int = 0,
+         images: list | None = None,
+-        keyframe_anchors: tuple[str, ...] = (),
++        keyframe_anchors: tuple[str | int, ...] = (),
+         height: int | None = None,
+         width: int | None = None,
++        condition_latent_rows: mx.array | None = None,
+         drop_adaln: bool = True,
+         verbose: bool = True,
+     ) -> GenerationResult:
+@@ -227,13 +228,32 @@ class MiniMaxH3Pipeline:
+         Args:
+             duration_seconds: 5 to 15; snapped up to the ``17n + 5`` frame grid the VAE encodes.
+             num_inference_steps: the weights are CFG-distilled, so each step is one forward.
+-            keyframe_anchors: ``"first"`` / ``"last"`` per conditioning keyframe, in packed order.
++            keyframe_anchors: ``"first"`` / ``"last"`` / a pixel-frame index per conditioning
++                block, in packed order.
+             height, width: override the canvas ``aspect`` would resolve to. Both must be multiples
+                 of 32. H3 was released for a 768-pixel short edge only, so anything else is
+                 off-distribution — useful for exercising the pipeline, not for quality.
++            condition_latent_rows: conditioning rows supplied *already patchified and normalized*,
++                in place of encoding keyframe images through the video VAE — the tail of a
++                previous clip handed straight back in, which is exactly the space
++                :meth:`_encode_keyframes` produces. Mutually exclusive with ``images``; one row
++                block per entry of ``keyframe_anchors``. The float16 round trip
++                :meth:`_encode_keyframes` performs is deliberately *not* applied here: it
++                reproduces a rounding that happens inside the reference's VAE encode, and these
++                rows were never encoded.
+         """
+         run_started = time.perf_counter()
+ 
++        # Refused before any work: both arguments fill the same slot, and `_encode_keyframes`
++        # would append a second block, leaving the conditioning twice as long as the packed
++        # layout says it is. Checked here rather than at the branch below so a request that
++        # cannot succeed does not first pay for a text encode.
++        if condition_latent_rows is not None and images:
++            raise ValueError(
++                "`condition_latent_rows` and `images` cannot be combined: both build the "
++                "conditioning block, and the packed layout has room for one of them."
++            )
++
+         # 1. Text conditioning. Keyframe vision blocks come back tagged as *video* rows.
+         prompt_embeds, text_token_tags = self.text_encoder.encode(prompt, images)
+ 
+@@ -264,9 +284,42 @@ class MiniMaxH3Pipeline:
+             print(f"packed sequence: {layout.sequence_length:,} rows "
+                   f"({len(text_token_tags):,} text, {layout.num_condition_video_rows:,} condition)")
+ 
+-        # 3. Keyframe conditioning rows, encoded before any request noise is drawn.
++        # 3. Keyframe conditioning rows, encoded before any request noise is drawn. Raw latent
++        #    rows, when supplied, take the place of that encode entirely.
+         condition_rows = None
+-        if images:
++        if condition_latent_rows is not None:
++            if condition_latent_rows.shape[0] == 0:
++                # A geometry that folds to `expected == (0, video_patch_dim)` (no conditioning
++                # blocks requested) would let an empty tail pass the shape check below unnoticed.
++                # It is not harmless: `condition_rows` would then be an empty array rather than
++                # `None`, so step 4 still draws `mx.random.normal(condition_rows.shape)` — zero
++                # values, but a real pull from the request's generator that shifts every noise
++                # draw after it away from a run that passed no `condition_latent_rows` at all,
++                # silently sharing that run's identity digest (`_IDENTITY_EXCLUDED`).
++                raise ValueError(
++                    "`condition_latent_rows` must not be empty (got shape "
++                    f"{tuple(condition_latent_rows.shape)}). Pass `None` instead of an empty "
++                    "block — an empty tail still draws a noise sample from the request's random "
++                    "generator and desyncs every row of noise generated after it."
++                )
++            expected = (layout.num_condition_video_rows, self.dit.config.video_patch_dim)
++            # The shape check is the load-bearing one: `mx.concatenate` below accepts a block of
++            # any length, and a wrong length shifts every generated row off the position ids,
++            # timestep plan and modality tags built for this layout — silently.
++            if tuple(condition_latent_rows.shape) != expected:
++                raise ValueError(
++                    f"`condition_latent_rows` must be shaped {expected} for this request "
++                    f"({len(keyframe_anchors)} conditioning blocks on a "
++                    f"{latent_height}x{latent_width} latent canvas), got "
++                    f"{tuple(condition_latent_rows.shape)}. A latent tail cannot cross a change "
++                    f"of resolution or of conditioning-block count."
++                )
++            if condition_latent_rows.dtype != mx.float32:
++                raise ValueError(
++                    f"`condition_latent_rows` must be float32, got {condition_latent_rows.dtype}."
++                )
++            condition_rows = condition_latent_rows
++        elif images:
+             condition_rows = self._encode_keyframes(images, height, width)
+ 
+         # 4. Initial noise. Draw order matches the reference — the conditioning noise comes off the
+@@ -278,6 +331,12 @@ class MiniMaxH3Pipeline:
+             condition_rows = MiniMaxH3Scheduler(shift=self.config.sigma_shift_video).scale_noise(
+                 condition_rows, KEYFRAME_NOISE_AUG, condition_noise
+             )
++            if condition_latent_rows is not None:
++                # Nothing has forced this array yet — the latent path skips `_encode_keyframes`
++                # and with it every `mx.eval` inside the VAE — so a lazy graph over a
++                # memory-mapped `mx.load` would otherwise survive into the first forward and be
++                # materialized under the transformer's own peak (spec §4.2).
++                mx.eval(condition_rows)
+ 
+         latents = mx.random.normal(
+             (1, self.video_vae.config.latent_channels, num_latent_frames, latent_height, latent_width)

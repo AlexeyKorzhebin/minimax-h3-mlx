@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+node_modules/
+test-results/
+playwright-report/
+
+# Vendored, unmodified clone of PipeNetwork/minimax-h3-mlx (Apache-2.0) — see the README's
+# Quickstart (step 0, which pins the commit) and NOTICE. Users clone it themselves; it is never
+# committed here.
+upstream/
+
+# Never commit weights or generated media — see NOTICE for why.
+*.safetensors
+*.npz
+*.mp4
+*.wav
+!tests/fixtures/processor/*.npz
+!tests/fixtures/tae/*.npz
+
+# Process artifacts from the planning/review workflow used to build this repo — not project
+# files, and not meant for a public clone.
+.superpowers/
+.gstack/

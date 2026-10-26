@@ -1,0 +1,32 @@
+diff --git a/minimax_h3_mlx/text_encoder.py b/minimax_h3_mlx/text_encoder.py
+index b02eb50..cb3dfd9 100644
+--- a/minimax_h3_mlx/text_encoder.py
++++ b/minimax_h3_mlx/text_encoder.py
+@@ -266,7 +266,26 @@ class MiniMaxH3TextEncoder:
+             )
+             inputs_embeds = self.language.embed_tokens(input_ids)
+             image_mask = input_ids == self.image_token_id
+-            inputs_embeds = mx.where(image_mask[..., None], hidden.astype(inputs_embeds.dtype)[None], inputs_embeds)
++            # PATCHED IN THIS FORK (the only edit to `upstream/`; see docs/RESULTS.md).
++            # The original line was:
++            #     inputs_embeds = mx.where(image_mask[..., None], hidden[None], inputs_embeds)
++            # `mx.where` broadcasts, so it needs `hidden` to have one row per *sequence* position,
++            # while the vision tower returns one row per *image* token — equal only if the prompt
++            # is 100% image tokens, which never happens. A 512x512 keyframe with a short prompt
++            # raised `[broadcast_shapes] Shapes (1,278,1) and (1,256,5120) cannot be broadcast`.
++            # This is a scatter, not a select: place the image rows at the masked positions and
++            # leave the text embeddings alone. Matches `mlx_vlm`'s `masked_scatter` and the
++            # reference's own behaviour. Upstream issue #2, second half.
++            positions = mx.array(np.nonzero(np.array(image_mask[0]))[0].astype(np.int32))
++            if positions.size != hidden.shape[0]:
++                raise ValueError(
++                    f"The request has {positions.size} image-token slots but the vision tower "
++                    f"returned {hidden.shape[0]} rows. Scattering would silently misalign the "
++                    "keyframe against the prompt."
++                )
++            embeds = inputs_embeds[0]
++            embeds[positions] = hidden.astype(embeds.dtype)
++            inputs_embeds = embeds[None]
+             visual_pos_masks = image_mask
+ 
+         # Qwen3-VL's 3D M-RoPE index, derived from the vision-start/pad token ids.

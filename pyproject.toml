@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "h3-48gb"
+version = "0.1.0"
+description = "Run MiniMax H3 video+audio generation on a 48 GB Apple Silicon Mac"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "mlx>=0.32.0",
+    "mlx-vlm>=0.6.10",
+    "numpy>=1.26",
+    "safetensors>=0.4",
+    "huggingface_hub>=0.30",
+    "pillow>=10.0",
+    # h3_48gb/facetrack.py: YuNet face detection (opencv-python) and Savitzky-Golay track
+    # smoothing (scipy). CPU-only and deliberately independent of the mlx stack above -- see that
+    # module's docstring -- but still a real runtime dependency once it is used.
+    "opencv-python>=4.9",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+h3 = "h3_48gb.cli:main"
+
+[tool.setuptools]
+packages = ["h3_48gb", "h3_48gb.engines"]
+
+[tool.pytest.ini_options]
+# `upstream/` is a vendored clone whose own tests import torch, which this fork does not install —
+# a bare `pytest` collected them and died with 5 collection errors before running a single test of
+# this fork's. Excluding them makes `pytest -q` the whole suite, root-level files included; those
+# four (test_adaln_indexing, test_lazy_pipeline, test_qkv_permutation, test_text_encoder_quant)
+# cover three of the four core patches and were invisible to the previously documented
+# `pytest tests/ test_preview.py`.
+norecursedirs = ["upstream", ".venv"]
+# `slow` marks a test that needs the GPU and minutes of wall time (the face-refine v2v smoke).
+# Registered so an ordinary run does not warn; the tests themselves also gate on an environment
+# variable, because a marker alone would still let a bare `pytest tests/` run them.
+markers = [
+    "slow: needs the GPU and minutes of wall time; opt in with an env var",
+    "mlx: needs the MLX stack (mlx, mlx-vlm, upstream/); skipped where it is not installed",
+    "cv: needs opencv-python and scipy; skipped where they are not installed",
+]
